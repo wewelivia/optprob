@@ -314,3 +314,204 @@ test_backfill_futures_options()
 test_backfill_guard_raises_actionably()
 test_underlying_whitespace_stripped()
 print("ALL FUTURES-BACKFILL TESTS PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Vol convention for rate futures.
+#
+# Regression cover for the live failure: SFRZ6 produced a density spanning
+# -5% to +12%, fit RMSE 31.6 vol points, rho pinned at -0.999, mode 1.31 vs
+# forward 3.97.
+#
+# Cause: IVOL_MID on a SOFR option is a lognormal vol on the RATE, quoted in
+# percent. Confirmed on the Terminal by diagnose_rate_vol.py: median
+# IVOL_MID / (vol implied by the mid price) = 2474.8 == (price/rate) x 100
+# == 24.2 x 100. Bloomberg returns ~20 -> app divides to 0.20 -> 0.20 used as
+# 20% of the 96.03 PRICE instead of 20% of the 3.97 RATE. ~24x too wide.
+#
+# Fix: for RATES_PRICE, ignore IVOL_MID and back the vol out of the mid price,
+# which is convention-free.
+# ---------------------------------------------------------------------------
+class _FakeRateVolBBG:
+    """Serves a SOFR chain the way the Terminal actually does: mid prices that
+    imply a ~0.8% PRICE vol, alongside an IVOL_MID quoted as a RATE vol in
+    percent (the trap)."""
+
+    F = 96.03
+    TRUE_PX_VOL = 0.008          # ~0.8% price vol => ~77bp normal. Realistic.
+
+    def __init__(self, expiry=None):
+        import datetime as _dt
+        self.expiry = expiry or (_dt.date.today() + _dt.timedelta(days=150))
+        self.strikes = [round(94.5 + 0.125 * i, 4) for i in range(25)]
+
+    def spot(self, ticker):
+        return self.F
+
+    def chain_tickers(self, ticker, call_put="C"):
+        return [f"SFRZ6{cp} {k:.3f} Comdty"
+                for k in self.strikes for cp in ("C", "P")]
+
+    def option_fields(self, tickers):
+        import pandas as pd
+        from app.data.bloomberg import act365
+        from app.data.chain_builder import _black76_price
+        import datetime as _dt
+
+        T = act365(_dt.date.today(), self.expiry)
+        rate = 100.0 - self.F
+        rows, idx = [], []
+        for tk in tickers:
+            cp = tk.split()[0][-1]
+            k = float(tk.split()[1])
+            px = _black76_price(self.F, k, T, self.TRUE_PX_VOL, is_call=(cp == "C"))
+            if px is None or px != px:
+                continue
+            # The trap: IVOL_MID as a lognormal RATE vol in PERCENT.
+            # sigma_rate = sigma_price * price / rate, then x100 for percent.
+            rate_vol_pct = self.TRUE_PX_VOL * self.F / rate * 100.0
+            idx.append(tk)
+            rows.append({
+                "ivol_mid": rate_vol_pct,          # ~19.4 -> app would use 0.194
+                "opt_strike_px": k,
+                "opt_expire_dt": self.expiry,
+                "opt_put_call": cp,
+                "px_bid": max(px - 0.0025, 0.0001),
+                "px_ask": px + 0.0025,
+                "px_last": px,
+                "open_int": 5000.0,
+                "px_volume": 250.0,
+                "opt_undl_px": self.F,
+            })
+        return pd.DataFrame(rows, index=idx)
+
+
+def test_rate_future_vol_from_price_not_ivol():
+    from app.data.chain_builder import build_chain
+    from app.data.bloomberg import BloombergProvider
+
+    bbg = _FakeRateVolBBG()
+    # build_chain dispatches on provider type, so borrow the live builder.
+    from app.data import chain_builder as cb
+    chain = cb._build_live(bbg, "SFRZ6 Comdty", n_expiries=3, max_options=200)
+
+    assert chain.asset_class == "RATES_PRICE"
+    sl = chain.expiries[0]
+    strikes, vols = sl.smile()
+    assert len(strikes) >= 8, f"only {len(strikes)} strikes survived"
+
+    # The trap value: had we trusted IVOL_MID we would be fitting ~0.194.
+    trap = _FakeRateVolBBG.TRUE_PX_VOL * _FakeRateVolBBG.F / (100 - _FakeRateVolBBG.F)
+    assert abs(trap - 0.194) < 0.01, "test premise drifted"
+    assert not any(abs(v - trap) < 0.02 for v in vols), \
+        f"IVOL_MID rate-vol leaked into the smile: {vols[:5]}"
+
+    # What we should have: the true PRICE vol, recovered from the mid.
+    import numpy as np
+    assert np.all(np.abs(vols - _FakeRateVolBBG.TRUE_PX_VOL) < 0.002), \
+        f"price vol not recovered: {vols[:5]}"
+    print(f"  ok: rate-future vol from mid price "
+          f"({vols.mean():.4f} ~ {_FakeRateVolBBG.TRUE_PX_VOL}), "
+          f"not the {trap:.3f} rate-vol trap")
+
+
+def test_rate_future_density_is_sane():
+    """The end-to-end symptom: the density must not fill the whole grid."""
+    from app.data import chain_builder as cb
+    from app.core.sabr import calibrate_sabr
+    from app.core.breeden_litzenberger import extract_rnd, to_rate_space
+    from app.data.bloomberg import ASSET_DEFAULTS
+
+    bbg = _FakeRateVolBBG()
+    chain = cb._build_live(bbg, "SFRZ6 Comdty", n_expiries=3, max_options=200)
+    sl = chain.expiries[0]
+    strikes, vols = sl.smile()
+    params = calibrate_sabr(sl.forward, strikes, vols, sl.T,
+                            beta=ASSET_DEFAULTS["RATES_PRICE"]["beta"],
+                            shift=chain.shift)
+    rnd = to_rate_space(extract_rnd(params, r=0.0,
+                                    strike_lo=float(strikes.min()) - 3.0,
+                                    strike_hi=float(strikes.max()) + 3.0,
+                                    n_grid=1200))
+    st = rnd.stats()
+
+    # The live symptoms, asserted away one by one.
+    assert params.rmse < 0.01, f"fit RMSE {params.rmse} (live bug gave 31.6)"
+    assert abs(params.rho) < 0.99, f"rho pinned at {params.rho}"
+    assert st["p05"] > 0.0, f"p05 {st['p05']:.2f}% negative (live bug: -5.04)"
+    assert st["p95"] < 8.0, f"p95 {st['p95']:.2f}% absurd (live bug: 11.96)"
+    assert st["std"] < 1.5, f"std {st['std']:.2f}% too wide (live bug: 5.42)"
+    # Mode, median and forward should now agree closely.
+    assert abs(st["mode"] - rnd.F) < 0.5, \
+        f"mode {st['mode']:.2f} vs fwd {rnd.F:.2f} (live bug: 1.31 vs 3.97)"
+    assert abs(st["median"] - rnd.F) < 0.3
+    print(f"  ok: sane density fwd={rnd.F:.2f}% median={st['median']:.2f}% "
+          f"p05={st['p05']:.2f}% p95={st['p95']:.2f}% std={st['std']:.2f}% "
+          f"rmse={params.rmse:.5f}")
+
+
+def test_no_time_value_quotes_rejected():
+    """Deep quotes at intrinsic carry no vol info and must not reach the fit."""
+    from app.data import chain_builder as cb
+
+    class _WithJunk(_FakeRateVolBBG):
+        def option_fields(self, tickers):
+            df = super().option_fields(tickers)
+            # Force a batch of deep quotes to sit exactly at intrinsic.
+            for tk in list(df.index)[:6]:
+                k = float(tk.split()[1])
+                cp = tk.split()[0][-1]
+                intrinsic = max(self.F - k, 0.0) if cp == "C" else max(k - self.F, 0.0)
+                df.loc[tk, "px_bid"] = max(intrinsic - 0.0001, 0.0001)
+                df.loc[tk, "px_ask"] = intrinsic + 0.0001
+            return df
+
+    chain = cb._build_live(_WithJunk(), "SFRZ6 Comdty", n_expiries=3,
+                           max_options=200)
+    _, vols = chain.expiries[0].smile()
+    import numpy as np
+    assert np.all(np.abs(vols - _FakeRateVolBBG.TRUE_PX_VOL) < 0.002), \
+        f"junk leaked into the smile: {sorted(vols)[:4]}"
+    print("  ok: zero-time-value quotes rejected before calibration")
+
+
+def test_equity_still_uses_ivol_mid():
+    """Regression: the SPX path must keep trusting IVOL_MID."""
+    from app.data import chain_builder as cb
+    import datetime as _dt
+    import pandas as pd
+
+    exp = _dt.date.today() + _dt.timedelta(days=150)
+
+    class _EqBBG:
+        def spot(self, t):
+            return 5500.0
+
+        def chain_tickers(self, t, call_put="C"):
+            d = exp.strftime("%m/%d/%y")
+            return [f"SPX US {d} C{k} Index" for k in range(5000, 6001, 100)]
+
+        def option_fields(self, tickers):
+            rows, idx = [], []
+            for tk in tickers:
+                k = float(tk.split()[3][1:])
+                idx.append(tk)
+                rows.append({"ivol_mid": 16.0,   # percent -> must become 0.16
+                             "opt_strike_px": k, "opt_expire_dt": exp,
+                             "opt_put_call": "C", "px_last": 50.0,
+                             "open_int": 100.0, "px_volume": 10.0})
+            return pd.DataFrame(rows, index=idx)
+
+    chain = cb._build_live(_EqBBG(), "SPX Index", n_expiries=3, max_options=200)
+    assert chain.asset_class == "EQ_INDEX"
+    _, vols = chain.expiries[0].smile()
+    import numpy as np
+    assert np.allclose(vols, 0.16), f"equity IVOL_MID path broken: {vols[:3]}"
+    print("  ok: equity path still uses IVOL_MID (16 -> 0.16)")
+
+
+test_rate_future_vol_from_price_not_ivol()
+test_rate_future_density_is_sane()
+test_no_time_value_quotes_rejected()
+test_equity_still_uses_ivol_mid()
+print("ALL VOL-CONVENTION TESTS PASSED")

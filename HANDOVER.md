@@ -448,3 +448,72 @@ futures chain.
 **Tests:** `tests/test_rate_space.py` — `_FakeFuturesBBG` serves SOFR-style
 tickers and BDP fields; asserts bdh is never handed an empty list, metadata
 resolves via BDP, the guard raises actionably, and whitespace is stripped.
+
+### 12.5 Vol convention for rate futures — RESOLVED (was §12.3's open caveat)
+
+§12.3 flagged the vol convention as unverified. It is now verified, and it was
+wrong. This is the most consequential bug found so far: the app produced a
+confident, plausible-looking, completely invalid density.
+
+**Symptom (live, SFRZ6 Comdty).** Fit RMSE **31.595** vol points, rho pinned at
+**-0.999**, density spanning **p05 -5.04% to p95 11.96%** with std 5.42%, mode
+1.31% against a forward of 3.97%. The smile showed market IV exploding to ~230%
+as the strike approached zero, ~20% at the money, and a junk floor of ~5% at
+negative strikes.
+
+**Diagnosis.** `IVOL_MID` on a SOFR option is a lognormal vol on the **RATE**,
+quoted in **percent** — not a vol on the price we fit. `diagnose_rate_vol.py`
+settled it by backing the vol out of the mid PRICE (convention-free) and
+comparing:
+
+    median IVOL_MID / (vol implied by price) = 2474.8
+    (price / rate) x 100                     = (96.03 / 3.97) x 100 = 2419
+    ratio / (price/rate)                     = 102.3   -> the factor of 100
+
+So Bloomberg returns ~20, the app correctly divided to 0.20, and 0.20 is 20% of
+the 3.97 **rate** (~79bp normal, entirely realistic) but was used as 20% of the
+96.03 **price** — about **24x too wide**. Hence a density that filled the whole
+grid (p05/p95 sat on the grid bounds) and a fit that could not fit.
+
+The smile shape was the tell: a lognormal vol quoted on the rate MUST explode as
+the rate strike approaches zero and is undefined below it. A price vol would do
+nothing of the sort near price 100.
+
+**Note the near-coincidence that makes this hard to eyeball.** Since
+`sigma_normal = sigma_lognormal x F` and F ~ 96 ~ 100, a normal vol in price
+points and a lognormal vol in percent are numerically almost identical here. You
+cannot identify the convention by magnitude. Back it out of the price.
+
+**Fix.** In `_build_live`, `prefer_price_iv = (asset_class == "RATES_PRICE")`.
+For rate futures `IVOL_MID` is ignored entirely and the vol is backed out of the
+mid price via `implied_vol_from_price`. Convention-free: the price is the price.
+Equity/FX/commodity paths are untouched and still trust `IVOL_MID`.
+
+Also added, because the junk quotes were dragging the fit:
+- `_MIN_TIME_VALUE = 0.005` — quotes at or inside intrinsic carry no vol
+  information; the back-out collapses to the solver floor and produces the flat
+  junk line at deep strikes. Rejected before calibration.
+- `_RATE_PX_VOL_MIN/MAX = 0.0005 / 0.10` — sanity bound on a rate-future price
+  vol.
+- Drop counters (`no_strike / no_expiry / no_time_value / no_iv /
+  implausible_iv`) are now logged per build, and `n_kept == 0` raises with the
+  breakdown plus the vol source used.
+
+**The `iv > 3.0` percent heuristic is also unsafe for rate futures** for a
+separate reason: their price vols are ~1%, below the threshold, so a genuine
+percent would sail through unconverted as 100% vol. Moot now that the path
+prefers the price back-out, but do not reintroduce it.
+
+**After the fix** (synthetic chain, true price vol 0.8%): fwd 3.97%, median
+3.97%, p05 3.16%, p95 4.78%, std 0.49%, RMSE ~0.
+
+**Tests:** `tests/test_rate_space.py` — `_FakeRateVolBBG` serves mid prices
+implying a realistic 0.8% price vol alongside the rate-vol trap in `IVOL_MID`,
+and asserts the trap never reaches the smile, the density is sane (every live
+symptom asserted away individually), junk quotes are rejected, and the equity
+`IVOL_MID` path still works.
+
+**Ops:** `diagnose_rate_vol.py` (repo root) re-checks the convention on any new
+contract or after a Bloomberg change. Its verdict thresholds compare raw
+(percent) against backed-out (decimal), so the rate-vol signature is
+`(price/rate) x 100`, not `price/rate`.

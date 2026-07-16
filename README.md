@@ -1,5 +1,9 @@
 # Option-Implied Probability Dashboard
 
+> **New to options, or handing this to someone who is?** Read
+> **[GUIDE.md](GUIDE.md)** — a plain-English walkthrough of every chart and statistic
+> on the screen, and what not to read into them. No maths required.
+
 Extract the **risk-neutral (option-implied) probability distribution** of an underlying
 from the listed options market, and answer event-probability questions such as:
 

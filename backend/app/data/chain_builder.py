@@ -79,6 +79,17 @@ def implied_vol_from_price(price: float, F: float, K: float, T: float,
     return 0.5 * (lo + hi)
 
 
+# Minimum time value (in price points) for a quote to carry vol information.
+# SOFR/FF options tick in 0.0025-0.005, so anything at or inside intrinsic plus
+# a tick is noise, not a price.
+_MIN_TIME_VALUE = 0.005
+
+# Sanity bounds on a rate-future PRICE vol (decimal). A 96 price moving 0.2-3%
+# a year spans roughly 20-300bp of normal vol, which brackets any real market.
+_RATE_PX_VOL_MIN = 0.0005
+_RATE_PX_VOL_MAX = 0.10
+
+
 def classify_asset(ticker: str) -> str:
     u = ticker.upper()
     # Rate futures must be tested BEFORE the .endswith("COMDTY") branch, which
@@ -202,9 +213,14 @@ def _build_live(bbg: BloombergProvider, underlying: str, n_expiries: int,
     by_exp: dict[dt.date, list[OptionQuote]] = defaultdict(list)
     undl_by_exp: dict[dt.date, list[float]] = defaultdict(list)
 
+    # Rate futures quote IVOL_MID on the RATE, not on the price we fit, so the
+    # vol must come from the mid price instead. See the block below.
+    prefer_price_iv = (asset_class == "RATES_PRICE")
+
     # Track how options are dropped so the failure is explainable.
     n_rows = 0
     n_no_strike = n_no_expiry = n_no_iv = n_kept = 0
+    n_no_tv = n_bad_iv = 0
 
     for tk, row in df.iterrows():
         n_rows += 1
@@ -241,20 +257,52 @@ def _build_live(bbg: BloombergProvider, underlying: str, n_expiries: int,
             elif last is not None and last > 0:
                 mid = last
 
-            # ---- implied vol: prefer IVOL_MID, else back out from mid price ----
-            iv = _f(row.get(c_iv)) if c_iv else None
-            if iv is not None and iv > 0:
-                if iv > 3.0:            # percent -> decimal
-                    iv = iv / 100.0
-            else:
-                iv = None
+            # ---- implied vol ----
+            # Equity/FX/commodity: trust IVOL_MID, which is quoted on the thing
+            # we fit, and convert percent -> decimal.
+            #
+            # RATE FUTURES: do NOT. Confirmed live via diagnose_rate_vol.py that
+            # IVOL_MID here is a lognormal vol on the RATE, quoted in percent --
+            # median IVOL_MID / (vol implied by the mid price) came out at
+            # ~2475, i.e. (price/rate) x 100 = 24.2 x 100. Bloomberg returns
+            # ~20, the app divided to 0.20, and 0.20 is 20% of the 3.97 RATE
+            # (~79bp normal), not 20% of the 96.03 PRICE. Used as a price vol it
+            # overstates the density ~24x: the RND then spanned -5% to +12% with
+            # a fit RMSE of 31.6 vol points and rho pinned at -0.999.
+            #
+            # The mid PRICE is convention-free, so back the vol out of it.
+            # Note the `iv > 3.0` percent heuristic is ALSO unsafe here for a
+            # second reason: rate-future price vols are ~1%, below the threshold,
+            # so a genuine percent would sail through unconverted.
+            iv = None
+            if not prefer_price_iv:
+                iv = _f(row.get(c_iv)) if c_iv else None
+                if iv is not None and iv > 0:
+                    if iv > 3.0:            # percent -> decimal
+                        iv = iv / 100.0
+                else:
+                    iv = None
             if iv is None and mid is not None:
                 F_est = spot  # refined per-expiry later; adequate for IV inversion
+                sh = float(defaults["shift"])
+                # An option with no meaningful time value carries no volatility
+                # information: the back-out collapses onto the solver's floor and
+                # produces the flat junk line seen at deep strikes, which then
+                # drags the whole calibration. Reject rather than fit.
+                Fs, Ks = F_est + sh, K + sh
+                intrinsic = max(Fs - Ks, 0.0) if pc == "C" else max(Ks - Fs, 0.0)
+                if (mid - intrinsic) < _MIN_TIME_VALUE:
+                    n_no_tv += 1
+                    continue
                 iv = implied_vol_from_price(mid, F_est, K, T,
-                                            is_call=(pc == "C"),
-                                            shift=float(defaults["shift"]))
+                                            is_call=(pc == "C"), shift=sh)
             if iv is None or not (iv > 0):
                 n_no_iv += 1
+                continue
+            if prefer_price_iv and not (_RATE_PX_VOL_MIN <= iv <= _RATE_PX_VOL_MAX):
+                # Sanity bound on a rate-future PRICE vol. Plausible is ~0.2-3%;
+                # anything outside this is a bad quote, not a market view.
+                n_bad_iv += 1
                 continue
 
             n_kept += 1
@@ -273,6 +321,27 @@ def _build_live(bbg: BloombergProvider, underlying: str, n_expiries: int,
                     undl_by_exp[exp].append(u)
         except Exception:
             continue
+
+    # Leave a breadcrumb: if a chain comes back thin, the reason should be
+    # readable rather than requiring a debugger.
+    import logging
+    logging.getLogger(__name__).info(
+        "build_chain %s [%s]: %d rows -> %d kept "
+        "(dropped: no_strike=%d no_expiry=%d no_time_value=%d no_iv=%d "
+        "implausible_iv=%d) vol_source=%s",
+        underlying, asset_class, n_rows, n_kept, n_no_strike, n_no_expiry,
+        n_no_tv, n_no_iv, n_bad_iv,
+        "mid_price_backout" if prefer_price_iv else "IVOL_MID",
+    )
+    if n_kept == 0:
+        raise ValueError(
+            f"No usable option quotes for {underlying!r} out of {n_rows} chain "
+            f"rows (no_strike={n_no_strike}, no_expiry={n_no_expiry}, "
+            f"no_time_value={n_no_tv}, no_iv={n_no_iv}, "
+            f"implausible_iv={n_bad_iv}). "
+            + ("Rate futures take their vol from the mid price, so missing "
+               "bid/ask is the usual cause." if prefer_price_iv else "")
+        )
 
     # Keep the nearest n_expiries with a reasonable number of strikes.
     exps = sorted(e for e, qs in by_exp.items() if len(qs) >= 5)[:n_expiries]
