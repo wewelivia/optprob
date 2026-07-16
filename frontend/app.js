@@ -104,10 +104,17 @@ function render(d) {
   $("odds").textContent = `Complement ${(d.complement*100).toFixed(1)}% · implied odds ${d.odds}`;
 
   $("m-und").textContent = d.underlying;
-  $("m-ac").textContent = d.asset_class;
+  // Flag the rate-space mapping explicitly. The fit and the Breeden-Litzenberger
+  // extraction ran in PRICE space (that is where the options are struck and
+  // where the quoted vols live); only the finished density was mapped to rates.
+  // Say so, so a mapped density is never mistaken for a natively-quoted one.
+  $("m-ac").textContent = d.rate_space
+    ? `${d.asset_class} (rate space, ${d.rate_future_ref}\u2212price)`
+    : d.asset_class;
   $("m-exp").textContent = d.expiry;
   $("m-t").textContent = d.T.toFixed(3);
-  $("m-fwd").textContent = fmtNum(d.forward);
+  $("m-fwd").textContent = fmtNum(d.forward) + (d.is_percent ? "%" : "")
+    + (d.rate_space ? ` (px ${fmtNum(d.forward_price_space)})` : "");
   $("m-src").textContent = d.source === "bloomberg" ? "Bloomberg" : "Synthetic";
 
   const unit = d.is_percent ? "%" : "";

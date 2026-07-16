@@ -100,6 +100,44 @@ class RiskNeutralDensity:
         }
 
 
+def to_rate_space(rnd: RiskNeutralDensity, ref: float = 100.0) -> RiskNeutralDensity:
+    """Map a PRICE-space density on an IMM-style rate future to RATE space.
+
+    SOFR / fed funds / Euribor futures quote as `ref - rate` (ref = 100), and
+    the listed options are struck on that PRICE. Bloomberg quotes their implied
+    vols against the price too, so the SABR calibration and the
+    Breeden-Litzenberger extraction must both happen in price space. Only the
+    finished density is mapped here. Mapping strikes to rates *before* fitting
+    would reverse the skew and distort the smile.
+
+    The change of variable R = ref - P is affine with |dP/dR| = 1, so the
+    density carries across untouched and only the grid is mirrored:
+
+        q_R(r) = q_P(ref - r)
+        F_R(r) = P(R <= r) = P(P >= ref - r) = 1 - F_P(ref - r)
+
+    Note the CDF complement: a call on the price is a put on the rate. Arrays
+    are reversed so the rate grid ascends and `quantile`'s np.interp on the CDF
+    stays monotonic.
+
+    `call_prices` and `fitted_vols` are carried across index-aligned to the
+    rate grid, but remain PRICE-space quantities: fitted_vols[i] is the Black-76
+    price vol at price strike (ref - strikes[i]), NOT a rate vol. They are kept
+    for the smile overlay, not for pricing in rate space.
+    """
+    K_rate = (ref - rnd.strikes)[::-1]
+    return RiskNeutralDensity(
+        strikes=K_rate,
+        pdf=rnd.pdf[::-1].copy(),
+        cdf=(1.0 - rnd.cdf)[::-1].copy(),
+        call_prices=rnd.call_prices[::-1].copy(),
+        fitted_vols=rnd.fitted_vols[::-1].copy(),
+        F=float(ref - rnd.F),
+        T=rnd.T,
+        r=rnd.r,
+    )
+
+
 def extract_rnd(
     params: SABRParams,
     r: float = 0.0,

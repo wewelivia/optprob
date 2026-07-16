@@ -99,11 +99,44 @@ class OptionChain:
 ASSET_DEFAULTS = {
     # beta and shift conventions per asset class for SABR
     "RATES":    {"beta": 0.5, "shift": 3.0},   # percent units; shift 3% displacement
+    # IMM-style rate futures (SOFR/FF/Euribor): the UNDERLYING is the price
+    # (100 - rate), so the fit happens in price space around ~95-99. No shift
+    # is needed (the price is comfortably positive) and beta mirrors the CMDTY
+    # convention. Override per-request via the API's `beta` if your desk's vol
+    # convention argues otherwise -- see the vol-convention caveat in README.
+    "RATES_PRICE": {"beta": 0.5, "shift": 0.0},
     "EQ_INDEX": {"beta": 1.0, "shift": 0.0},
     "EQUITY":   {"beta": 1.0, "shift": 0.0},
     "FX":       {"beta": 0.5, "shift": 0.0},
     "CMDTY":    {"beta": 0.5, "shift": 0.0},
 }
+
+# Price reference for IMM-style rate futures: rate = RATE_FUTURE_REF - price.
+RATE_FUTURE_REF = 100.0
+
+# IMM-style rate-futures roots quoted as (100 - rate). Extend as needed; the
+# regex below is deliberately strict (root + month code + 1-2 digit year) so a
+# genuine commodity ticker cannot be swallowed by accident. Getting this wrong
+# is not a cosmetic error: it would mirror the density about 100.
+RATE_FUTURE_ROOTS = ("SFR", "SER", "FF", "ER", "SFI", "ED", "BA")
+
+_IMM_MONTH_CODES = "FGHJKMNQUVXZ"
+_RATE_FUTURE_RE = re.compile(
+    r"^(?:" + "|".join(sorted(RATE_FUTURE_ROOTS, key=len, reverse=True)) + r")"
+    r"[" + _IMM_MONTH_CODES + r"]"
+    r"\d{1,2}\s+COMDTY$",
+    re.IGNORECASE,
+)
+
+
+def is_rate_future(ticker: str) -> bool:
+    """True for IMM-style rate futures quoted as (100 - rate), e.g.
+    'SFRZ6 Comdty' (Dec-26 3M SOFR), 'FFF7 Comdty' (Jan-27 fed funds).
+
+    Strict by design: requires root + IMM month code + year + ' Comdty'. A
+    false positive here would mirror a commodity's density about 100.
+    """
+    return bool(_RATE_FUTURE_RE.match(str(ticker).strip()))
 
 
 def act365(as_of: dt.date, expiry: dt.date) -> float:
@@ -617,8 +650,13 @@ class MockProvider:
         "CL1 Comdty":    ("CMDTY", 78.0),
         # Rates: express the underlying as the RATE in percent (e.g. implied
         # policy rate). Fed funds / SOFR style.
-        "FEDFUNDS":      ("RATES", 4.50),
-        "SOFR":          ("RATES", 4.60),
+        # Levels track the Jul-2026 setting: target range 3.50-3.75%, EFFR 3.63%.
+        "FEDFUNDS":      ("RATES", 3.63),
+        "SOFR":          ("RATES", 3.68),
+        # IMM-style rate futures: the underlying is the PRICE (100 - rate), so
+        # these seed around 96 and the app maps the density back to rate space.
+        "SFRZ6 Comdty":  ("RATES_PRICE", 96.05),
+        "FFZ6 Comdty":   ("RATES_PRICE", 96.10),
     }
 
     def __init__(self, seed: int = 7):
@@ -630,6 +668,9 @@ class MockProvider:
             return self.PRESETS[key]
         # Heuristic classification for unknown tickers.
         u = key.upper()
+        # Rate futures first: they end in COMDTY and would be claimed below.
+        if is_rate_future(u):
+            return ("RATES_PRICE", 96.0)
         if u.endswith("INDEX"):
             return ("EQ_INDEX", 5000.0)
         if u.endswith("EQUITY"):
@@ -639,7 +680,7 @@ class MockProvider:
         if u.endswith("COMDTY"):
             return ("CMDTY", 80.0)
         if any(t in u for t in ("FED", "SOFR", "RATE", "OIS")):
-            return ("RATES", 4.5)
+            return ("RATES", 3.63)
         return ("EQUITY", 100.0)
 
     def _smile_vol(self, asset_class: str, F: float, K: np.ndarray, T: float) -> np.ndarray:
@@ -654,6 +695,15 @@ class MockProvider:
         if asset_class == "RATES":
             m = (K - F)                     # absolute rate difference, percent
             atm, skew, conv = 0.40, 0.010, 0.020
+        elif asset_class == "RATES_PRICE":
+            # Price space around ~96. Log-moneyness would be near-zero across
+            # the whole grid (log(97/96) ~ 0.01), so the smile would be flat.
+            # Use the absolute price difference instead. Price vol is LOW in
+            # lognormal terms because the price barely moves in percentage
+            # terms even when the rate moves a lot: 25bp on a 3.95% rate is
+            # 6% of the rate but 0.26% of a 96.05 price.
+            m = (K - F)
+            atm, skew, conv = 0.012, -0.0008, 0.0010
         else:
             m = np.log(K / F)               # log-moneyness
             if asset_class == "EQ_INDEX":
@@ -678,6 +728,11 @@ class MockProvider:
         # Strike grid per asset class
         if asset_class == "RATES":
             strikes = np.round(np.arange(F0 - 2.0, F0 + 2.01, 0.125), 3)
+        elif asset_class == "RATES_PRICE":
+            # Listed SOFR/FF option strikes step in 0.125 (12.5bp) near the
+            # money. F0*linspace(0.6,1.5) would span 58-144, meaningless for a
+            # (100 - rate) price.
+            strikes = np.round(np.arange(F0 - 1.5, F0 + 1.51, 0.125), 3)
         elif asset_class == "FX":
             strikes = np.round(F0 * np.linspace(0.85, 1.15, 25), 4)
         else:

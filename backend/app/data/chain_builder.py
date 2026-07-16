@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 from collections import defaultdict
 
 import numpy as np
 
 from .bloomberg import (ASSET_DEFAULTS, BloombergProvider, MockProvider,
-                        OptionChain, OptionQuote, ExpirySlice, act365)
+                        OptionChain, OptionQuote, ExpirySlice, act365,
+                        is_rate_future)
 
 
 def _norm_cdf(x: float) -> float:
@@ -79,6 +81,10 @@ def implied_vol_from_price(price: float, F: float, K: float, T: float,
 
 def classify_asset(ticker: str) -> str:
     u = ticker.upper()
+    # Rate futures must be tested BEFORE the .endswith("COMDTY") branch, which
+    # would otherwise claim them.
+    if is_rate_future(u):
+        return "RATES_PRICE"
     if any(t in u for t in ("FED", "SOFR", " OIS", "RATE")):
         return "RATES"
     if u.endswith("INDEX"):

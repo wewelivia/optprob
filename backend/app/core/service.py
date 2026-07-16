@@ -10,19 +10,25 @@ from functools import lru_cache
 
 import numpy as np
 
-from ..data.bloomberg import (ASSET_DEFAULTS, BloombergProvider, MockProvider,
-                              get_provider)
+from ..data.bloomberg import (ASSET_DEFAULTS, RATE_FUTURE_REF, BloombergProvider,
+                              MockProvider, get_provider)
 from ..data.chain_builder import build_chain, classify_asset
 from ..data.positioning_store import PositioningStore, rows_from_chain
 from .sabr import calibrate_sabr
-from .breeden_litzenberger import extract_rnd
+from .breeden_litzenberger import extract_rnd, to_rate_space
 from .event_parser import parse_condition, compute_probability
 from .conviction import (ConvictionEngine, ConvictionConfig,
                          summarize_positioning)
 
 # Contract multiplier by asset class (for premium/notional).
 _MULTIPLIER = {"EQ_INDEX": 100.0, "EQUITY": 100.0, "FX": 1.0,
-               "CMDTY": 1.0, "RATES": 1.0}
+               "CMDTY": 1.0, "RATES": 1.0,
+               # 3M SOFR convention: $25 per basis point => $2,500 per price
+               # point. NOTE this is contract-specific -- 30-day fed funds (FF)
+               # is ~$41.67/bp on a 1M notional, Euribor is EUR 25/bp. Premium
+               # notional for non-SOFR rate futures will be wrong until this is
+               # keyed by root rather than asset class.
+               "RATES_PRICE": 2500.0}
 
 _STORE = PositioningStore()
 
@@ -243,6 +249,15 @@ def _grid_bounds(chain, sl, strikes):
     if chain.asset_class == "RATES":
         span = max(4.0, 6.0 * sl.forward * math.sqrt(max(sl.T, 0.05)) / 4.0)
         return sl.forward - min(sl.forward + chain.shift - 1e-6, span), sl.forward + span
+    if chain.asset_class == "RATES_PRICE":
+        # Price space, bounded near 100. The generic branch below would give
+        # 0.4*min .. 1.7*max, i.e. ~38 to ~165 for strikes around 96 -- absurd
+        # for a (100 - rate) price and it would waste most of the grid. Pad the
+        # listed strikes instead. Cap at 110 rather than 100 so negative rates
+        # remain representable.
+        lo = float(strikes.min()) - 3.0
+        hi = float(strikes.max()) + 3.0
+        return max(lo, 0.0), min(hi, 110.0)
     return float(strikes.min() * 0.4), float(strikes.max() * 1.7)
 
 
@@ -307,22 +322,58 @@ def compute_positioning(underlying: str, condition: str | None = None,
         rows_today = [r for r in rows_from_chain(chain) if r.expiry == sl.expiry]
     summary = summarize_positioning(rows_today, sl.expiry, convictions, mult)
 
+    # --- rate-space display mapping ----------------------------------------
+    # The store stays in PRICE space, which is the contract's real strike and
+    # what Bloomberg returns; only the display is mapped, so the OI chart lines
+    # up with the rate-space PDF the frontend overlays on it. Without this the
+    # two axes silently disagree.
+    #
+    # call_put is deliberately NOT relabelled: a call on the price is a put on
+    # the rate, and quietly flipping it would misrepresent the actual contract.
+    # It stays as the real contract type; `rate_space` tells the reader to
+    # interpret it accordingly.
+    rate_space = chain.asset_class == "RATES_PRICE"
+    strikes_out = [c.as_dict() for c in convictions]
+    summary_out = summary.as_dict()
+    forward_out = sl.forward
+    spot_out = chain.spot
+    if rate_space:
+        for d in strikes_out:
+            if d.get("strike") is not None:
+                d["strike_price_space"] = float(d["strike"])
+                d["strike"] = float(RATE_FUTURE_REF - d["strike"])
+        strikes_out.sort(key=lambda d: (d["strike"], d.get("call_put") or ""))
+        for k in ("oi_center_of_gravity", "max_pain"):
+            v = summary_out.get(k)
+            if v is not None:
+                summary_out[f"{k}_price_space"] = float(v)
+                summary_out[k] = float(RATE_FUTURE_REF - v)
+        for d in summary_out.get("top_conviction") or []:
+            if isinstance(d, dict) and d.get("strike") is not None:
+                d["strike_price_space"] = float(d["strike"])
+                d["strike"] = float(RATE_FUTURE_REF - d["strike"])
+        forward_out = float(RATE_FUTURE_REF - sl.forward)
+        spot_out = (float(RATE_FUTURE_REF - chain.spot)
+                    if chain.spot is not None else None)
+
     n_dates = len(_STORE.available_dates(chain.underlying, before=chain.as_of))
     return {
         "underlying": chain.underlying,
         "asset_class": chain.asset_class,
         "source": chain.source,
         "expiry": sl.expiry.isoformat(),
-        "forward": sl.forward,
-        "spot": chain.spot,
+        "forward": forward_out,
+        "spot": spot_out,
+        "rate_space": rate_space,
+        "rate_future_ref": RATE_FUTURE_REF if rate_space else None,
         "as_of": chain.as_of.isoformat(),
         "history_days": n_dates,
         "deltas_available": n_dates >= 2,
         "windows": {"short": short_window, "trend": trend_window,
                     "context": context_window},
         "weights": {"iv": cfg.w_iv, "vol_oi": cfg.w_voloi, "oi": cfg.w_oi},
-        "summary": summary.as_dict(),
-        "strikes": [c.as_dict() for c in convictions],
+        "summary": summary_out,
+        "strikes": strikes_out,
     }
 
 
@@ -357,7 +408,7 @@ def compute_distribution(underlying: str, condition: str,
     # around it (guarantees the expiry nearest the target is fetched).
     fp_pre = force_percent
     if fp_pre is None:
-        fp_pre = classify_asset(underlying) == "RATES"
+        fp_pre = classify_asset(underlying) in ("RATES", "RATES_PRICE")
     spec = parse_condition(condition, force_percent=fp_pre)
 
     chain = _get_chain(underlying, prefer_live, target_date=spec.target_date)
@@ -367,7 +418,7 @@ def compute_distribution(underlying: str, condition: str,
     # Re-derive percent semantics now that we know the true asset class.
     fp = force_percent
     if fp is None:
-        fp = chain.asset_class == "RATES"
+        fp = chain.asset_class in ("RATES", "RATES_PRICE")
     if fp != fp_pre:
         spec = parse_condition(condition, force_percent=fp)
 
@@ -388,12 +439,36 @@ def compute_distribution(underlying: str, condition: str,
     lo, hi = _grid_bounds(chain, sl, strikes)
     rnd = extract_rnd(params, r=r, strike_lo=lo, strike_hi=hi, n_grid=1200)
 
+    # --- rate-space transform for IMM-style rate futures --------------------
+    # Everything above ran in PRICE space, which is where the options are
+    # struck and where Bloomberg quotes the vols, so the SABR fit and the BL
+    # second derivative are untouched by this. Only the finished density is
+    # mapped, so the strategist can ask "above 4%" instead of translating to
+    # "below 96" in their head.
+    rate_space = chain.asset_class == "RATES_PRICE"
+    forward_out = sl.forward
+    if rate_space:
+        rnd = to_rate_space(rnd, ref=RATE_FUTURE_REF)
+        forward_out = float(RATE_FUTURE_REF - sl.forward)
+
     ev = compute_probability(rnd, spec)
 
-    # Fitted vols at market strikes for the smile overlay
+    # Fitted vols at market strikes for the smile overlay. In rate space the
+    # x-axis is mapped to rates so it lines up with the density; the vols
+    # themselves stay PRICE-space Black-76 vols (there is no such thing as a
+    # rate vol here without refitting), and both spaces are returned so the
+    # frontend never has to guess.
     fitted = params.vol(strikes)
-    smile = [{"strike": float(k), "market_vol": float(mv), "fitted_vol": float(fv)}
-             for k, mv, fv in zip(strikes, mvols, fitted)]
+    if rate_space:
+        smile = [{"strike": float(RATE_FUTURE_REF - k),
+                  "strike_price_space": float(k),
+                  "market_vol": float(mv), "fitted_vol": float(fv)}
+                 for k, mv, fv in zip(strikes, mvols, fitted)]
+        smile.sort(key=lambda d: d["strike"])
+    else:
+        smile = [{"strike": float(k), "strike_price_space": float(k),
+                  "market_vol": float(mv), "fitted_vol": float(fv)}
+                 for k, mv, fv in zip(strikes, mvols, fitted)]
 
     # Downsample RND arrays for transport
     idx = np.linspace(0, len(rnd.strikes) - 1, min(n_out, len(rnd.strikes))).astype(int)
@@ -408,7 +483,10 @@ def compute_distribution(underlying: str, condition: str,
         "source": chain.source,
         "expiry": sl.expiry.isoformat(),
         "T": sl.T,
-        "forward": sl.forward,
+        "forward": forward_out,
+        "forward_price_space": float(sl.forward) if rate_space else None,
+        "rate_space": rate_space,
+        "rate_future_ref": RATE_FUTURE_REF if rate_space else None,
         "is_percent": spec.is_percent,
         "sabr": params.as_dict(),
         "smile": smile,

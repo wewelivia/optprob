@@ -296,3 +296,119 @@ flat noise ⇒ Low). Keep the other three suites green when changing shared code
 - Persist per-underlying backfill status so the UI can prompt "seed history" only when needed.
 - Optional: expose center-of-gravity / max-pain as vertical markers on the OI chart.
 ```
+
+---
+
+## 12. Amendment — 16 Jul 2026 (bdh shape fix + rate-space transform)
+
+Two changes since the original document. Both were driven by live-Terminal
+findings, so §§5-11 above remain accurate except where noted here.
+
+### 12.1 `bdh_fields` was broken live (backfill 500)
+
+**Symptom.** `POST /api/backfill` returned
+`500 Backfill failed: cannot insert date, already exists`.
+
+**Cause.** Not SQLite and not Bloomberg — pandas. `bdh_fields` assumed xbbg 0.x's
+shape (DatetimeIndex + MultiIndex `(ticker, field)` columns) and did
+`df.index.name = "date"` then `reset_index()`. The installed xbbg is the
+**Rust/Arrow-backed v1 line**, which has no index concept, so `date` arrives as
+an ordinary **column** next to a RangeIndex. Naming the RangeIndex "date"
+collided with the existing column.
+
+**Confirmed shape on the Terminal machine** (via `diagnose_bdh.py`): xbbg v1
+returns an **already-tidy long frame**, `['ticker','date','field','value']`,
+RangeIndex, flat columns. Not the wide shape originally assumed.
+
+**Second bug hiding behind the first.** Because the frame has flat (not
+MultiIndex) columns, the old `else` branch would have fired and stamped every
+row with `tickers[0]` — silently writing all ~800 members' history under one
+ticker. The crash prevented a data-corruption bug.
+
+**Fix.** New module-level `normalise_bdh(raw, tickers, flds)` in
+`data/bloomberg.py` — a pure function (testable without a Terminal, mirroring
+the bloomberg.py/chain_builder.py split). It *detects* where dates live rather
+than asserting it: DatetimeIndex first, then a `date` column, else raises
+explicitly. Handles four shapes: 0.x wide/MultiIndex, v1 tidy-long, `date`
+column + flat `ticker|field` columns, and stringified tuple labels.
+`_split_ticker_field` parses labels. Covered by `tests/test_xbbg_shapes.py`.
+
+**Ops.** `diagnose_bdh.py` (repo root) dumps the raw/unwrapped/normalised shapes;
+run it before the backfill on any new machine or after an xbbg upgrade.
+Backfill on `SPX Index` days=90 seeded **25,748 rows** (~32 dates/contract of
+~62 trading days — patchy, as expected, and well above `min_context_points=8`).
+
+**`POSITIONING_DB` moved off OneDrive.** SQLite on a sync client risks
+corruption. `_DEFAULT_DB` resolves at **module import time**, so the env var must
+exist *before* uvicorn starts.
+
+### 12.2 New asset class `RATES_PRICE` — rate-space transform
+
+**Problem.** IMM-style rate futures (SOFR/fed funds/Euribor) quote as
+`100 - rate` and their options are struck on that PRICE. Previously
+`classify_asset("SFRZ6 Comdty")` fell through to `CMDTY`, forcing the user to
+ask "below 96 by December" and translate by hand.
+
+**Where the transform sits (do not move this).** The SABR fit and the
+Breeden-Litzenberger extraction run in **price space**, because that is where
+the options are struck and where Bloomberg quotes the vols. Only the *finished
+density* is mapped. Mapping strikes to rates before fitting would reverse the
+skew and distort the smile.
+
+`core/breeden_litzenberger.to_rate_space(rnd, ref=100.0)`. The change of
+variable `R = ref - P` is affine with `|dP/dR| = 1`, so:
+
+    q_R(r) = q_P(ref - r)          # density carries across untouched
+    F_R(r) = 1 - F_P(ref - r)      # note the complement: a call on the
+                                   # price is a put on the rate
+
+Arrays are reversed so the rate grid ascends (`quantile`'s `np.interp` needs a
+monotone CDF). `call_prices` / `fitted_vols` are carried index-aligned but
+remain **price-space** quantities.
+
+**Detection is deliberately strict.** `is_rate_future()` in `data/bloomberg.py`
+requires root + IMM month code + 1-2 digit year + ` Comdty`
+(`RATE_FUTURE_ROOTS = SFR, SER, FF, ER, SFI, ED, BA`). A false positive would
+mirror a commodity's density about 100, so `CLZ6`/`GCZ6` etc. are explicitly
+tested as non-matches. Extend `RATE_FUTURE_ROOTS` for new contracts.
+
+**Touched:** `ASSET_DEFAULTS["RATES_PRICE"]` (beta 0.5, shift 0);
+`_MULTIPLIER["RATES_PRICE"] = 2500`; `_grid_bounds` price-space branch
+(the generic `0.4*min .. 1.7*max` would span ~38-165 for strikes near 96);
+`compute_distribution` (transform + `rate_space`/`forward_price_space`/
+`rate_future_ref` response keys, smile x-axis mapped, `strike_price_space`
+retained); `compute_positioning` (display-only strike mapping so the OI chart
+aligns with the rate-space PDF overlay — **the store stays price space**);
+MockProvider presets + smile/strike-grid branches; `frontend/app.js` badge.
+
+**`call_put` is NOT relabelled** in rate space. A call on the price is a put on
+the rate; quietly flipping the label would misrepresent the contract. It stays
+as the real contract type — `rate_space: true` tells the reader to interpret it.
+
+**Tests:** `tests/test_rate_space.py`. The load-bearing assertion is
+`P(rate > r) == P(price < ref - r)`; if that ever fails the dashboard is
+answering the opposite question. Also covers involution, pdf area, monotone
+CDF, forward/mean/quantile mapping, and that SPX/FEDFUNDS paths are unaffected.
+
+### 12.3 Known caveats added
+
+- **Vol convention is unverified for rate futures.** `chain_builder` does
+  `if iv > 3.0: iv = iv/100.0`, which assumes a *lognormal percent* vol. Rates
+  desks commonly quote **normal (Bachelier) vols in bp**. If Bloomberg returns
+  normal vols for SOFR options, an 80bp vol would be read as 0.80 = 80%
+  lognormal and the density would be nonsense. **Check `IVOL_MID` on a known
+  SOFR option against OVME before trusting a live rate-future read.** Untested
+  against live data — the mock seeds lognormal price vols by construction.
+- **`_MULTIPLIER["RATES_PRICE"] = 2500`** is the 3M SOFR convention ($25/bp).
+  30-day fed funds (FF) and Euribor differ, so `total_premium_notional` is
+  wrong for non-SOFR rate futures until the multiplier is keyed by root.
+- **Settlement averaging.** SOFR futures settle to compounded average daily
+  SOFR over the 3M reference quarter; FF futures to the monthly average of
+  daily EFFR. The density therefore describes an **average rate over a period**,
+  not the policy rate on a meeting date. This is *not* a per-meeting hike
+  probability — WIRP does that. The dashboard's edge is the full distribution
+  (tails, "two or more hikes"), which WIRP handles clumsily; it complements
+  WIRP rather than replacing it.
+- **`FEDFUNDS` is a mock preset, not a Bloomberg ticker.** Live it fails at
+  `spot()` (no PX_LAST). Presets refreshed to the Jul-2026 setting
+  (target 3.50-3.75%, EFFR 3.63%); they were seeded at 4.50, ~87bp stale.
