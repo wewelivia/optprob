@@ -344,6 +344,52 @@ def _f(v):
         return None
 
 
+def _meta_from_bdp(bbg, tickers: list[str]) -> dict:
+    """Resolve (expiry, strike, call_put) via BDP for tickers whose metadata is
+    not recoverable from the ticker string.
+
+    Needed for FUTURES options. Equity/index tickers embed the date
+    ('SPXW US 07/17/26 C4300 Index'), but an IMM futures option does not:
+    'SFRZ6C 96.00 Comdty' carries the strike and C/P yet has NO expiry in the
+    string at all. No regex can recover it -- it has to come from Bloomberg.
+    """
+    out: dict = {}
+    if not tickers:
+        return out
+    try:
+        df = bbg.option_fields(tickers)
+    except Exception:
+        return out
+    if df is None or getattr(df, "empty", True):
+        return out
+
+    cols = {str(c).lower(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n.lower() in cols:
+                return cols[n.lower()]
+        return None
+
+    c_k = col("opt_strike_px", "strike")
+    c_exp = col("opt_expire_dt", "expiry")
+    c_pc = col("opt_put_call", "put_call")
+
+    for tk, row in df.iterrows():
+        K = _f(row.get(c_k)) if c_k else None
+        exp = _to_date(row.get(c_exp)) if c_exp else None
+        if K is None or K <= 0 or exp is None:
+            continue
+        pc_raw = str(row.get(c_pc)).strip().upper()[:1] if c_pc else ""
+        if pc_raw not in ("C", "P", "1", "0"):
+            # Futures options encode C/P in the ticker root, e.g. SFRZ6C / SFRZ6P.
+            m = re.search(r"([CP])\s*\d", str(tk).upper())
+            pc_raw = m.group(1) if m else "C"
+        out[tk] = {"expiry": exp, "strike": float(K),
+                   "call_put": "C" if pc_raw in ("C", "1") else "P"}
+    return out
+
+
 def backfill_history_rows(bbg: BloombergProvider, underlying: str,
                           days: int = 90, n_expiries: int = 6,
                           max_options: int = 800):
@@ -366,12 +412,30 @@ def backfill_history_rows(bbg: BloombergProvider, underlying: str,
     if not members:
         return []
 
-    # Map each ticker to its parsed (strike, expiry, call_put) once.
+    # Map each ticker to its (strike, expiry, call_put) once. Ticker parsing is
+    # the fast path and works for equity/index conventions; futures options
+    # ('SFRZ6C 96.00 Comdty') carry no expiry in the string, so anything that
+    # does not parse is resolved via BDP instead.
     meta = {}
+    unparsed = []
     for tk in members:
         p = _parse_opt_ticker(str(tk))
         if p and p.get("expiry") and p.get("strike"):
             meta[tk] = p
+        else:
+            unparsed.append(tk)
+    if unparsed:
+        meta.update(_meta_from_bdp(bbg, unparsed))
+
+    if not meta:
+        # Without this guard bdh() is called with an empty securities list and
+        # blpapi raises the opaque "securities is required for
+        # HistoricalDataRequest". Fail with something actionable instead.
+        raise ValueError(
+            f"Could not resolve strike/expiry for any of {len(members)} chain "
+            f"members of {underlying!r} (tried ticker parsing then BDP "
+            f"OPT_STRIKE_PX/OPT_EXPIRE_DT). Sample: {list(members)[:3]}"
+        )
 
     flds = ["OPEN_INT", "IVOL_MID", "PX_LAST", "PX_VOLUME"]
     long = bbg.bdh_fields(list(meta.keys()), flds, start, as_of)

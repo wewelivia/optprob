@@ -287,6 +287,7 @@ def compute_positioning(underlying: str, condition: str | None = None,
     notional). Deltas need >=2 stored snapshots on different dates; a one-time
     bdh backfill can seed this (see /api/backfill).
     """
+    underlying = (underlying or "").strip()
     # Determine target expiry the same way the distribution does.
     target_date = None
     if condition:
@@ -387,6 +388,9 @@ def backfill_positioning(underlying: str, days: int = 90,
     granular OI/volume history is patchy, so this is best-effort: whatever bdh
     returns is stored; gaps are simply absent from the series.
     """
+    # Trailing whitespace from a UI field would otherwise become part of the
+    # store key, silently splitting one underlying's history across two rows.
+    underlying = (underlying or "").strip()
     provider = get_provider(prefer_live=prefer_live)
     if isinstance(provider, MockProvider):
         return {"seeded": 0, "note": "mock provider; backfill skipped"}
@@ -404,6 +408,7 @@ def compute_distribution(underlying: str, condition: str,
                          prefer_live: bool = True,
                          n_out: int = 250) -> dict:
     """Full pipeline: returns everything the frontend needs to render."""
+    underlying = (underlying or "").strip()
     # Parse the condition first so we know the target date, then build the chain
     # around it (guarantees the expiry nearest the target is fetched).
     fp_pre = force_percent

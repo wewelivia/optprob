@@ -412,3 +412,39 @@ CDF, forward/mean/quantile mapping, and that SPX/FEDFUNDS paths are unaffected.
 - **`FEDFUNDS` is a mock preset, not a Bloomberg ticker.** Live it fails at
   `spot()` (no PX_LAST). Presets refreshed to the Jul-2026 setting
   (target 3.50-3.75%, EFFR 3.63%); they were seeded at 4.50, ~87bp stale.
+
+### 12.4 Backfill on FUTURES options (`securities is required` 500)
+
+**Symptom.** `POST /api/backfill?underlying=SFRZ6 Comdty` returned
+`500 Backfill failed: securities is required for HistoricalDataRequest`.
+`SPX Index` worked fine.
+
+**Cause.** `backfill_history_rows` built its `meta` dict purely by parsing
+ticker strings. `_parse_opt_ticker` expects the equity/index convention
+(`SPXW US 07/17/26 C4300 Index`), which embeds the date. A futures option
+(`SFRZ6C 96.00 Comdty`) carries the strike and C/P but **no expiry in the
+string at all** — no regex can recover it. Every parse returned None, `meta`
+was `{}`, and `bdh()` was called with an empty securities list. There was a
+guard for empty `members` but none for empty `meta`, so blpapi's opaque error
+surfaced instead of an actionable one.
+
+**Fix.** Ticker parsing stays the fast path; anything that fails now falls back
+to `_meta_from_bdp()`, which resolves `OPT_STRIKE_PX` / `OPT_EXPIRE_DT` /
+`OPT_PUT_CALL` via BDP (C/P also recoverable from the ticker root,
+`SFRZ6C` / `SFRZ6P`). An explicit guard raises before `bdh` if nothing
+resolves. Costs one extra BDP call on a one-time backfill.
+
+**Also:** `underlying` is now `.strip()`ed in `compute_distribution`,
+`compute_positioning` and `backfill_positioning`. A trailing space from a UI
+field would otherwise become part of the store primary key and silently split
+one underlying's history in two.
+
+**Note.** `_select_members_by_expiry` still groups by *ticker-parsed* expiry,
+so for futures options it falls through to `members[:max_options]` (no expiry
+spread). Harmless in practice — `OPT_CHAIN` on `SFRZ6 Comdty` returns options
+on that one contract — but it would matter if pointed at a multi-expiry
+futures chain.
+
+**Tests:** `tests/test_rate_space.py` — `_FakeFuturesBBG` serves SOFR-style
+tickers and BDP fields; asserts bdh is never handed an empty list, metadata
+resolves via BDP, the guard raises actionably, and whitespace is stripped.

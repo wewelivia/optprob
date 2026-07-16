@@ -194,3 +194,123 @@ test_transform_wellformed()
 test_end_to_end()
 test_non_rate_unaffected()
 print("ALL RATE-SPACE TESTS PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Backfill on FUTURES options.
+#
+# Regression cover for the live failure:
+#   "Backfill failed: securities is required for HistoricalDataRequest"
+# Cause: backfill_history_rows built `meta` purely by parsing tickers.
+# _parse_opt_ticker expects an equity-style 'MM/DD/YY C<strike>' ticker; a
+# futures option ('SFRZ6C 96.00 Comdty') carries NO expiry in the string, so
+# every parse returned None, meta was {}, and bdh() was called with an empty
+# securities list. There was a guard for empty `members` but not for empty
+# `meta`.
+# ---------------------------------------------------------------------------
+class _FakeFuturesBBG:
+    """Bloomberg stand-in returning SOFR-option tickers and their BDP fields."""
+
+    EXPIRY = __import__("datetime").date(2026, 12, 11)
+
+    def __init__(self):
+        self.strikes = [95.50, 95.75, 96.00, 96.25, 96.50]
+        self.tickers = [f"SFRZ6{cp} {k:.2f} Comdty"
+                        for k in self.strikes for cp in ("C", "P")]
+        self.bdh_calls = []
+
+    def chain_tickers(self, ticker, call_put="C"):
+        return list(self.tickers)
+
+    def option_fields(self, tickers):
+        import pandas as pd
+        rows = []
+        for tk in tickers:
+            cp = tk.split()[0][-1]
+            k = float(tk.split()[1])
+            rows.append({"opt_strike_px": k, "opt_expire_dt": self.EXPIRY,
+                         "opt_put_call": cp})
+        return pd.DataFrame(rows, index=list(tickers))
+
+    def bdh_fields(self, tickers, flds, start, end):
+        import datetime as _dt
+        import pandas as pd
+        self.bdh_calls.append(list(tickers))
+        if not tickers:
+            # Mirror blpapi's real behaviour so the test fails the same way.
+            raise Exception("securities is required for HistoricalDataRequest")
+        days = [end - _dt.timedelta(days=i) for i in range(4)]
+        rec = []
+        for tk in tickers:
+            for d in days:
+                rec += [{"date": d, "ticker": tk, "field": "open_int", "value": 1200.0},
+                        {"date": d, "ticker": tk, "field": "ivol_mid", "value": 0.012},
+                        {"date": d, "ticker": tk, "field": "px_last", "value": 0.15},
+                        {"date": d, "ticker": tk, "field": "px_volume", "value": 300.0}]
+        return pd.DataFrame(rec)
+
+
+def test_backfill_futures_options():
+    from app.data import chain_builder as cb
+
+    bbg = _FakeFuturesBBG()
+
+    # The ticker parser genuinely cannot do this -- confirm the premise.
+    assert all(cb._parse_opt_ticker(t) is None for t in bbg.tickers), \
+        "futures tickers unexpectedly parseable; test premise is stale"
+
+    rows = cb.backfill_history_rows(bbg, "SFRZ6 Comdty", days=30,
+                                    max_options=100)
+    assert rows, "no rows produced"
+    # bdh must never be handed an empty securities list.
+    assert all(c for c in bbg.bdh_calls), "bdh called with empty securities"
+
+    # Metadata resolved via BDP, not the ticker string.
+    assert {r.strike for r in rows} == set(bbg.strikes)
+    assert {r.call_put for r in rows} == {"C", "P"}
+    assert {r.expiry for r in rows} == {_FakeFuturesBBG.EXPIRY}
+    assert all(r.underlying == "SFRZ6 Comdty" for r in rows)
+    assert all(r.open_interest == 1200.0 for r in rows)
+    print(f"  ok: futures-option backfill via BDP -> {len(rows)} rows, "
+          f"{len({r.strike for r in rows})} strikes")
+
+
+def test_backfill_guard_raises_actionably():
+    """Unresolvable metadata must raise something a human can act on, not
+    blpapi's opaque 'securities is required'."""
+    from app.data import chain_builder as cb
+
+    class _Blind(_FakeFuturesBBG):
+        def option_fields(self, tickers):
+            import pandas as pd
+            return pd.DataFrame()   # BDP resolves nothing
+
+    bbg = _Blind()
+    try:
+        cb.backfill_history_rows(bbg, "SFRZ6 Comdty", days=30, max_options=100)
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        msg = str(e)
+        assert "Could not resolve strike/expiry" in msg
+        assert "SFRZ6" in msg
+    assert not any(c == [] for c in bbg.bdh_calls), "bdh reached with empty list"
+    print("  ok: unresolvable metadata raises actionably before touching bdh")
+
+
+def test_underlying_whitespace_stripped():
+    """A trailing space from a UI field must not become part of the store key."""
+    from app.core import service
+    a = service.compute_distribution("SFRZ6 Comdty ", "above 4% by December",
+                                     prefer_live=False)
+    b = service.compute_distribution("SFRZ6 Comdty", "above 4% by December",
+                                     prefer_live=False)
+    assert a["underlying"] == b["underlying"] == "SFRZ6 Comdty"
+    assert a["asset_class"] == "RATES_PRICE"
+    assert abs(a["probability"] - b["probability"]) < 1e-12
+    print("  ok: trailing whitespace stripped from underlying")
+
+
+test_backfill_futures_options()
+test_backfill_guard_raises_actionably()
+test_underlying_whitespace_stripped()
+print("ALL FUTURES-BACKFILL TESTS PASSED")
