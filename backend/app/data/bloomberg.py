@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -172,6 +173,124 @@ def _to_pandas(obj):
         return pd.DataFrame(obj)
     except Exception:
         return obj
+
+
+_LONG_COLS = ["date", "ticker", "field", "value"]
+
+# Matches a stringified tuple label, e.g. "('SPX Index', 'open_int')".
+_TUPLE_LABEL_RE = re.compile(r"""^\(\s*['"](?P<tk>.+?)['"]\s*,\s*['"](?P<fld>.+?)['"]\s*\)$""")
+
+
+def _split_ticker_field(label, known_flds: list[str], default_tk: str):
+    """Split one wide-frame column label into (ticker, field).
+
+    Handles every label shape seen across xbbg versions:
+      ('SPX Index', 'open_int')     -> real MultiIndex tuple
+      "('SPX Index', 'open_int')"   -> stringified tuple (survives a polars round-trip)
+      "SPX Index|open_int"          -> pre-flattened
+      "SPX Index open_int"          -> concatenated (matched via known field suffix)
+      "open_int"                    -> bare field, single-ticker request
+    """
+    if isinstance(label, tuple):
+        parts = [str(x) for x in label if str(x).strip()]
+        if len(parts) >= 2:
+            return parts[0].strip(), parts[1].strip().lower()
+        return default_tk, (parts[0].strip().lower() if parts else "")
+
+    s = str(label).strip()
+    m = _TUPLE_LABEL_RE.match(s)
+    if m:
+        return m.group("tk").strip(), m.group("fld").strip().lower()
+
+    for sep in ("|", "::"):
+        if sep in s:
+            tk, fld = s.rsplit(sep, 1)
+            return tk.strip(), fld.strip().lower()
+
+    low = s.lower()
+    # Longest field first so 'px_last' wins over a hypothetical 'last'.
+    for f in sorted(known_flds, key=len, reverse=True):
+        if low == f:
+            return default_tk, f
+        if low.endswith(f):
+            tk = s[: len(s) - len(f)].strip(" _-.")
+            return (tk or default_tk), f
+    return default_tk, low
+
+
+def normalise_bdh(raw, tickers, flds):
+    """Coerce ANY xbbg bdh return shape into a tidy long frame
+    [date, ticker, field, value].
+
+    Why this is defensive rather than assuming a shape: xbbg 0.x returned a
+    DatetimeIndex with MultiIndex (ticker, field) columns. The Rust/Arrow-backed
+    v1 line returns a narwhals wrapper whose native frame has NO index at all --
+    Arrow and polars have no index concept -- so `date` arrives as an ordinary
+    column alongside a RangeIndex. Code that did `df.index.name = "date"` then
+    `reset_index()` blew up with "cannot insert date, already exists" against
+    the newer shape. We now detect where the dates actually live instead of
+    asserting where they ought to be.
+    """
+    pd = _pd()
+    empty = pd.DataFrame(columns=_LONG_COLS)
+    if raw is None or getattr(raw, "empty", True):
+        return empty
+
+    df = raw.copy()
+    known = [str(f).lower() for f in ([flds] if isinstance(flds, str) else list(flds or []))]
+    if isinstance(tickers, str):
+        default_tk = tickers
+    else:
+        tk_list = list(tickers or [])
+        default_tk = tk_list[0] if len(tk_list) == 1 else ""
+
+    # Flat (non-tuple) column labels, lowercased, for shape sniffing.
+    flat = {str(c).lower(): c for c in df.columns if not isinstance(c, tuple)}
+
+    # ---- Shape 1: already tidy long ------------------------------------
+    if {"date", "field", "value"} <= set(flat):
+        out = pd.DataFrame({
+            "date": df[flat["date"]].values,
+            "ticker": (df[flat["ticker"]].values if "ticker" in flat else default_tk),
+            "field": pd.Series(df[flat["field"]].values).astype(str).str.lower().values,
+            "value": df[flat["value"]].values,
+        })
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out["value"] = pd.to_numeric(out["value"], errors="coerce")
+        return out[_LONG_COLS]
+
+    # ---- Locate the date vector ----------------------------------------
+    if isinstance(df.index, pd.DatetimeIndex) or str(df.index.dtype).startswith("datetime"):
+        dates = list(df.index)                       # xbbg 0.x shape
+        df = df.reset_index(drop=True)
+    elif "date" in flat:
+        dates = list(df[flat["date"]])               # polars/Arrow-origin shape
+        df = df.drop(columns=[flat["date"]]).reset_index(drop=True)
+    else:
+        raise ValueError(
+            "bdh returned a frame with no recognisable date index or column; "
+            f"columns={list(df.columns)[:8]} index_dtype={df.index.dtype}"
+        )
+
+    # ---- Melt the remaining wide columns -------------------------------
+    frames = []
+    for col in df.columns:
+        tk, fld = _split_ticker_field(col, known, default_tk)
+        frames.append(pd.DataFrame({
+            "date": dates,
+            "ticker": tk,
+            "field": fld,
+            "value": df[col].values,
+        }))
+    if not frames:
+        return empty
+
+    long = pd.concat(frames, ignore_index=True)
+    long["date"] = pd.to_datetime(long["date"], errors="coerce")
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    # Drop rows where the value never parsed (ticker-label columns, blanks).
+    long = long[long["value"].notna()].reset_index(drop=True)
+    return long[_LONG_COLS]
 
 
 def _flat_columns(df) -> list[str]:
@@ -465,26 +584,7 @@ class BloombergProvider:
         blp = self._xbbg
         raw = _to_pandas(blp.bdh(tickers=tickers, flds=flds,
                                  start_date=start, end_date=end))
-        if raw is None or getattr(raw, "empty", True):
-            return _pd().DataFrame(columns=["date", "ticker", "field", "value"])
-        pd = _pd()
-        df = raw.copy()
-        # xbbg returns a DatetimeIndex of dates and MultiIndex columns
-        # (ticker, field). Stack both column levels into long form.
-        df.index.name = "date"
-        if isinstance(df.columns, pd.MultiIndex):
-            long = (df.stack(level=[0, 1], future_stack=True)
-                      .rename("value").reset_index())
-            long.columns = ["date", "ticker", "field", "value"]
-        else:
-            # single ticker/field: columns are just field names
-            long = df.reset_index().melt(id_vars="date", var_name="field",
-                                         value_name="value")
-            tk = tickers if isinstance(tickers, str) else (tickers[0]
-                    if tickers else "")
-            long.insert(1, "ticker", tk)
-        long["value"] = pd.to_numeric(long["value"], errors="coerce")
-        return long
+        return normalise_bdh(raw, tickers, flds)
 
     # NOTE: build_chain() that assembles OptionChain from the above lives in
     # chain_builder.py so the parsing logic is testable independently of the
