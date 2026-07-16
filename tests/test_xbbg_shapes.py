@@ -105,3 +105,89 @@ if __name__ == "__main__":
     test_flatten_bdp_multiindex()
     test_build_live_with_fake_blp()
     print("\nALL XBBG-SHAPE TESTS PASSED")
+
+
+# ---------------------------------------------------------------------------
+# bdh_fields / normalise_bdh shape handling
+#
+# Regression cover for the live backfill failure:
+#   "Backfill failed: cannot insert date, already exists"
+# Root cause: bdh_fields assumed a DatetimeIndex and did `df.index.name="date"`
+# then `reset_index()`. The Rust/Arrow-backed xbbg v1 returns a frame whose
+# native form has NO index, so `date` arrives as a COLUMN -> label collision.
+# ---------------------------------------------------------------------------
+def test_normalise_bdh_shapes():
+    import datetime as _dt
+    import pandas as _pd
+    from app.data.bloomberg import normalise_bdh
+
+    days = [_dt.date(2026, 7, 14), _dt.date(2026, 7, 15)]
+    tks = ["SPX 12/18/26 C5500 Index", "SPX 12/18/26 C5600 Index"]
+    flds = ["OPEN_INT", "IVOL_MID"]
+
+    def _check(df, label, expect_rows):
+        out = normalise_bdh(df, tks, flds)
+        assert list(out.columns) == ["date", "ticker", "field", "value"], label
+        assert len(out) == expect_rows, f"{label}: {len(out)} != {expect_rows}"
+        assert set(out["field"]) == {"open_int", "ivol_mid"}, label
+        assert set(out["ticker"]) == set(tks), label
+        assert out["value"].notna().all(), label
+        print(f"  ok: {label} -> {len(out)} rows")
+
+    # Shape A: xbbg 0.x - DatetimeIndex + MultiIndex (ticker, field) columns
+    a = _pd.DataFrame(
+        [[100, 0.18, 200, 0.19], [110, 0.20, 210, 0.21]],
+        index=_pd.DatetimeIndex(days),
+        columns=_pd.MultiIndex.from_product([tks, ["open_int", "ivol_mid"]]),
+    )
+    _check(a, "0.x DatetimeIndex + MultiIndex cols", 8)
+
+    # Shape B: xbbg v1 / Arrow origin - RangeIndex, 'date' as a COLUMN.
+    # This is the shape that produced the 500.
+    b = _pd.DataFrame({
+        "date": days,
+        f"{tks[0]}|open_int": [100, 110],
+        f"{tks[0]}|ivol_mid": [0.18, 0.20],
+        f"{tks[1]}|open_int": [200, 210],
+        f"{tks[1]}|ivol_mid": [0.19, 0.21],
+    })
+    _check(b, "v1 RangeIndex + date column (the 500)", 8)
+
+    # Shape C: stringified tuple labels (survives a polars round-trip)
+    c = _pd.DataFrame({
+        "date": days,
+        f"('{tks[0]}', 'open_int')": [100, 110],
+        f"('{tks[0]}', 'ivol_mid')": [0.18, 0.20],
+        f"('{tks[1]}', 'open_int')": [200, 210],
+        f"('{tks[1]}', 'ivol_mid')": [0.19, 0.21],
+    })
+    _check(c, "stringified tuple labels", 8)
+
+    # Shape D: already tidy long
+    d = _pd.DataFrame({
+        "date": days * 4,
+        "ticker": [tks[0]] * 4 + [tks[1]] * 4,
+        "field": ["open_int", "open_int", "ivol_mid", "ivol_mid"] * 2,
+        "value": [100, 110, 0.18, 0.20, 200, 210, 0.19, 0.21],
+    })
+    _check(d, "already tidy long", 8)
+
+    # Empty / None must degrade, not raise.
+    for e in (None, _pd.DataFrame()):
+        out = normalise_bdh(e, tks, flds)
+        assert out.empty and list(out.columns) == ["date", "ticker", "field", "value"]
+    print("  ok: empty/None degrade cleanly")
+
+    # No date anywhere must fail loudly rather than silently mis-key rows.
+    try:
+        normalise_bdh(_pd.DataFrame({"open_int": [1, 2]}), tks, flds)
+        raise AssertionError("expected ValueError for date-less frame")
+    except ValueError as exc:
+        assert "no recognisable date" in str(exc)
+    print("  ok: date-less frame raises explicitly")
+
+    print("--- test_normalise_bdh_shapes PASSED ---\n")
+
+
+test_normalise_bdh_shapes()
+print("ALL BDH-SHAPE TESTS PASSED")
