@@ -6,6 +6,14 @@
 <title>Option-Implied Probability Dashboard</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 <link rel="stylesheet" href="/static/style.css" />
+<style>
+  /* Assessment panel (interpreter) — self-contained so style.css is untouched */
+  .interp-headline{font-size:1.05rem;font-weight:600;margin:2px 0 10px}
+  .interp-sec h4{margin:12px 0 4px;font-size:.78rem;text-transform:uppercase;
+    letter-spacing:.06em;opacity:.65}
+  .interp-sec p{margin:0;line-height:1.55}
+  .interp-sec.caveat p{opacity:.6;font-size:.85rem}
+</style>
 </head>
 <body>
 <header>
@@ -67,6 +75,13 @@
         <div><span>Forward</span><b id="m-fwd">—</b></div>
         <div><span>Data source</span><b id="m-src">—</b></div>
       </div>
+    </div>
+
+    <!-- ================= Plain-English assessment (interpreter) ========== -->
+    <div id="interp" class="card hidden">
+      <h3>Assessment</h3>
+      <p id="interp-headline" class="interp-headline"></p>
+      <div id="interp-sections"></div>
     </div>
 
     <div class="grid2">

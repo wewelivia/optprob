@@ -64,3 +64,6 @@ class DistributionResponse(BaseModel):
     # Extra readouts
     complement: float
     odds: str
+    # Rule-based plain-English assessment (headline, sections, inputs).
+    # Optional so older clients and cached responses stay valid.
+    interpretation: Optional[dict] = None

@@ -96,6 +96,22 @@ async function run() {
   }
 }
 
+// ================= Plain-English assessment (interpreter) =================
+function renderInterpretation(interp) {
+  const box = $("interp");
+  if (!box) return;
+  if (!interp || !interp.sections || !interp.sections.length) {
+    box.classList.add("hidden");
+    return;
+  }
+  $("interp-headline").textContent = interp.headline || "";
+  $("interp-sections").innerHTML = interp.sections.map((s) => {
+    const cls = /caveat/i.test(s.title) ? "interp-sec caveat" : "interp-sec";
+    return `<div class="${cls}"><h4>${s.title}</h4><p>${s.text}</p></div>`;
+  }).join("");
+  box.classList.remove("hidden");
+}
+
 function render(d) {
   $("result").classList.remove("hidden");
   const pct = (d.probability * 100).toFixed(1) + "%";
@@ -103,13 +119,15 @@ function render(d) {
   $("prob-cond").textContent = `P( ${d.underlying} ${d.condition} )`;
   $("odds").textContent = `Complement ${(d.complement*100).toFixed(1)}% · implied odds ${d.odds}`;
 
+  renderInterpretation(d.interpretation);
+
   $("m-und").textContent = d.underlying;
   // Flag the rate-space mapping explicitly. The fit and the Breeden-Litzenberger
   // extraction ran in PRICE space (that is where the options are struck and
   // where the quoted vols live); only the finished density was mapped to rates.
   // Say so, so a mapped density is never mistaken for a natively-quoted one.
   $("m-ac").textContent = d.rate_space
-    ? `${d.asset_class} (rate space, ${d.rate_future_ref}\u2212price)`
+    ? `${d.asset_class} (rate space, ${d.rate_future_ref}−price)`
     : d.asset_class;
   $("m-exp").textContent = d.expiry;
   $("m-t").textContent = d.T.toFixed(3);

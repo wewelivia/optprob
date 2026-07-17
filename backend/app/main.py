@@ -24,13 +24,14 @@ from fastapi.staticfiles import StaticFiles
 
 from .models.schemas import ProbabilityRequest, ChainResponse, DistributionResponse
 from .core import service
+from .core import interpreter
 from .data.bloomberg import MockProvider, get_provider
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("rnd")
 
-app = FastAPI(title="Option-Implied Probability Dashboard", version="1.0.0")
+app = FastAPI(title="Option-Implied Probability Dashboard", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,7 +109,7 @@ def chain(underlying: str = Query(...), prefer_live: bool = True):
 @app.post("/api/distribution", response_model=DistributionResponse)
 def distribution(req: ProbabilityRequest):
     try:
-        return service.compute_distribution(
+        result = service.compute_distribution(
             underlying=req.underlying,
             condition=req.condition,
             beta=req.beta,
@@ -123,6 +124,23 @@ def distribution(req: ProbabilityRequest):
         log.error("Distribution failed for %r / %r:\n%s",
                   req.underlying, req.condition, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Computation failed: {e}")
+
+    # --- plain-English interpretation (rule-based, never blocks the result) --
+    # The chain is cached (60s TTL), so this positioning call reuses it and
+    # adds little latency. Positioning is best-effort: without snapshot
+    # history the interpreter simply says so and reads pricing alone.
+    positioning = None
+    try:
+        positioning = service.compute_positioning(
+            underlying=req.underlying, condition=req.condition,
+            expiry=result.get("expiry"))
+    except Exception:
+        positioning = None
+    try:
+        result["interpretation"] = interpreter.interpret(result, positioning)
+    except Exception:
+        result["interpretation"] = None
+    return result
 
 
 @app.get("/api/positioning")
